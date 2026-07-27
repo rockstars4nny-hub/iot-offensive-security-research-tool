@@ -1,0 +1,1216 @@
+#!/usr/bin/env python3
+"""
+iot_scanner.py - IoT Camera / Drone Security Assessment Tool
+
+For authorized internal security testing only.
+Do not use on devices you do not own or have explicit permission to test.
+
+Modules:
+  1. UART auto-baud detection + shell access detection
+  2. Firmware extraction (via UART shell) + offline save
+  3. Firmware analysis (binwalk + string-based credential/secret scanning)
+  4. Network discovery (common IoT/camera/drone service ports)
+  5. MAVLink drone assessment (signing check, plaintext telemetry, benign
+     command-acceptance test)
+  6. BLE sniffing (device discovery + GATT enumeration, exposed-credential
+     scanning on readable characteristics)
+
+Author: internal security tooling. Output: structured JSON findings.
+"""
+
+import argparse
+import asyncio
+import json
+import os
+import re
+import socket
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+
+# ----------------------------------------------------------------------------
+# Optional dependencies - degrade gracefully instead of crashing on import.
+# ----------------------------------------------------------------------------
+try:
+    import serial  # pyserial
+except ImportError:
+    serial = None
+
+try:
+    from pymavlink import mavutil
+except ImportError:
+    mavutil = None
+
+try:
+    from bleak import BleakScanner, BleakClient  # BLE
+except ImportError:
+    BleakScanner = None
+    BleakClient = None
+
+TOOL_NAME = "iot_scanner"
+TOOL_VERSION = "1.1.0"
+
+SAFETY_BANNER = (
+    "For authorized testing only. Do not use on devices you do not own "
+    "or have explicit permission to test."
+)
+
+COMMON_BAUD_RATES = [9600, 19200, 38400, 57600, 115200, 230400]
+
+# port -> (service name, category) used for network discovery + triage
+COMMON_PORTS = {
+    21:   ("FTP", "cleartext-file-transfer"),
+    22:   ("SSH", "remote-shell"),
+    23:   ("Telnet", "cleartext-remote-shell"),
+    80:   ("HTTP", "web"),
+    443:  ("HTTPS", "web-tls"),
+    554:  ("RTSP", "video-stream"),
+    5000: ("UPnP/HTTP-Alt", "web"),
+    5760: ("MAVLink-TCP", "mavlink"),
+    7070: ("RTSP-Alt", "video-stream"),
+    8000: ("HTTP-Alt", "web"),
+    8080: ("HTTP-Proxy", "web"),
+    8554: ("RTSP-Alt2", "video-stream"),
+    8883: ("MQTT-TLS", "iot-messaging"),
+    1883: ("MQTT", "cleartext-iot-messaging"),
+    9999: ("Misc-IoT-Debug", "debug"),
+    14550: ("MAVLink-UDP", "mavlink"),
+    18570: ("MAVLink-UDP-Alt", "mavlink"),
+}
+
+# Regex patterns run against firmware strings to catch hardcoded secrets.
+# Each entry: (compiled pattern, human label, severity)
+CRED_PATTERNS = [
+    (re.compile(rb'-----BEGIN (RSA|DSA|EC|OPENSSH) PRIVATE KEY-----'),
+     "SSH/TLS private key embedded in firmware", "CRITICAL"),
+    (re.compile(rb'(?i)root:\$?[0-9a-z$./]*:0:0:'),
+     "Root /etc/passwd or /etc/shadow entry with password hash", "HIGH"),
+    (re.compile(rb'(?i)(pass(word)?|pwd)\s*[:=]\s*[\'"]?[^\s\'"]{4,32}'),
+     "Hardcoded password string", "HIGH"),
+    (re.compile(rb'(?i)(api[_-]?key|apikey|access[_-]?key)\s*[:=]\s*[\'"]?[A-Za-z0-9_\-]{8,64}'),
+     "Hardcoded API key", "HIGH"),
+    (re.compile(rb'(?i)(secret|token|bearer)\s*[:=]\s*[\'"]?[A-Za-z0-9_\-\.]{8,64}'),
+     "Hardcoded secret/token", "HIGH"),
+    (re.compile(rb'(?i)https?://[a-z0-9.\-]+\.(amazonaws|aliyuncs|myqcloud|azure|cloudfront)\.[a-z]{2,}\S*'),
+     "Cloud service endpoint in firmware", "MEDIUM"),
+    (re.compile(rb'(?i)mqtt://[^\s\'"]+'),
+     "Cleartext MQTT broker endpoint", "MEDIUM"),
+    (re.compile(rb'(?i)wpa[_-]?(psk|passphrase)\s*[:=]\s*[\'"]?[^\s\'"]{4,64}'),
+     "Hardcoded WiFi PSK/passphrase", "HIGH"),
+]
+
+# Bluetooth SIG-assigned 16-bit UUIDs all sit inside this 128-bit template
+# (0000XXXX-0000-1000-8000-00805F9B34FB). Anything that DOESN'T match it is
+# a vendor-custom UUID -- more likely to be a proprietary data/control
+# channel worth manual review than a standard, publicly-documented GATT
+# service (Battery Service, Device Information, etc).
+_STANDARD_BLE_UUID_RE = re.compile(
+    r'^0000[0-9a-f]{4}-0000-1000-8000-00805f9b34fb$', re.IGNORECASE
+)
+
+
+def is_standard_ble_uuid(uuid_str):
+    return bool(_STANDARD_BLE_UUID_RE.match(uuid_str))
+
+
+# Byte patterns that suggest a live interactive shell prompt on UART.
+SHELL_PROMPT_PATTERNS = [
+    re.compile(rb'BusyBox'),
+    re.compile(rb'[#\$>]\s*$'),
+    re.compile(rb'(?i)login\s*:'),
+    re.compile(rb'(?i)username\s*:'),
+    re.compile(rb'U-Boot'),
+]
+
+
+def now_iso():
+    return datetime.now(timezone.utc).isoformat()
+
+
+# ----------------------------------------------------------------------------
+# Findings / Report
+# ----------------------------------------------------------------------------
+class Finding:
+    _counter = 0
+
+    def __init__(self, severity, category, title, description, remediation,
+                 device_type=None, interface=None, evidence=None):
+        Finding._counter += 1
+        self.id = f"F-{Finding._counter:04d}"
+        self.severity = severity  # CRITICAL / HIGH / MEDIUM / LOW / INFO
+        self.category = category
+        self.title = title
+        self.description = description
+        self.remediation = remediation
+        self.device_type = device_type
+        self.interface = interface
+        self.evidence = evidence
+        self.timestamp = now_iso()
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "severity": self.severity,
+            "category": self.category,
+            "title": self.title,
+            "description": self.description,
+            "remediation": self.remediation,
+            "device_type": self.device_type,
+            "interface": self.interface,
+            "evidence": self.evidence,
+            "timestamp": self.timestamp,
+        }
+
+
+class Report:
+    def __init__(self, targets):
+        self.started_at = now_iso()
+        self.targets = targets
+        self.findings = []
+
+    def add(self, *args, **kwargs):
+        f = Finding(*args, **kwargs)
+        self.findings.append(f)
+        return f
+
+    def to_dict(self):
+        summary = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0, "INFO": 0}
+        for f in self.findings:
+            summary[f.severity] = summary.get(f.severity, 0) + 1
+        return {
+            "tool": TOOL_NAME,
+            "version": TOOL_VERSION,
+            "safety_notice": SAFETY_BANNER,
+            "started_at": self.started_at,
+            "finished_at": now_iso(),
+            "targets": self.targets,
+            "summary": summary,
+            "findings": [f.to_dict() for f in self.findings],
+        }
+
+
+def log(msg, quiet=False):
+    """Verbose/progress output. Never goes to stdout when --quiet is set,
+    so quiet mode's stdout stays pure JSON."""
+    if not quiet:
+        print(f"[*] {msg}", file=sys.stderr)
+
+
+# ----------------------------------------------------------------------------
+# Module 1 + 2: UART auto-baud detection, shell detection, firmware dump
+# ----------------------------------------------------------------------------
+class UARTScanner:
+    def __init__(self, port, baud_list=None, timeout=2.0, quiet=False):
+        self.port = port
+        self.baud_list = baud_list or COMMON_BAUD_RATES
+        self.timeout = timeout
+        self.quiet = quiet
+
+    def _open(self, baud):
+        return serial.Serial(
+            port=self.port, baudrate=baud, timeout=self.timeout,
+            bytesize=serial.EIGHTBITS, parity=serial.PARITY_NONE,
+            stopbits=serial.STOPBITS_ONE,
+        )
+
+    def scan_baud_rates(self, report):
+        """Try each common baud rate, send a newline, and look for a
+        coherent / printable response. Returns the ser handle + baud on
+        success (caller is responsible for closing it), or (None, None)."""
+        if serial is None:
+            report.add(
+                "INFO", "dependency", "pyserial not installed",
+                "pyserial is required for UART operations but is not installed.",
+                "pip install pyserial", interface=self.port,
+            )
+            return None, None
+
+        for baud in self.baud_list:
+            log(f"UART: trying {self.port} @ {baud} baud", self.quiet)
+            try:
+                ser = self._open(baud)
+            except serial.SerialException as e:
+                # Permission denied, device busy, or port doesn't exist.
+                # Same error will repeat for every baud rate, so bail out
+                # of the whole scan rather than looping uselessly.
+                report.add(
+                    "INFO", "uart", "Unable to open serial port",
+                    f"Could not open {self.port}: {e}",
+                    "Check device path, permissions (dialout group / udev "
+                    "rules), and that no other process holds the port.",
+                    interface=self.port,
+                )
+                return None, None
+            except OSError as e:
+                report.add(
+                    "INFO", "uart", "Serial port OS error",
+                    f"OS error opening {self.port}: {e}",
+                    "Verify the device is connected and not in use.",
+                    interface=self.port,
+                )
+                return None, None
+
+            try:
+                ser.reset_input_buffer()
+                ser.write(b'\r\n')
+                time.sleep(0.3)
+                data = ser.read(512)
+
+                if data and self._looks_valid(data):
+                    report.add(
+                        "INFO", "uart", "UART baud rate identified",
+                        f"Device responds coherently at {baud} baud on "
+                        f"{self.port}.",
+                        "Disable or restrict physical UART access on "
+                        "production units (remove header, disable console).",
+                        interface=f"{self.port}@{baud}",
+                        evidence=self._safe_preview(data),
+                    )
+                    return ser, baud
+            except serial.SerialException as e:
+                log(f"UART: read error at {baud} baud: {e}", self.quiet)
+            finally:
+                if not (ser and ser.is_open and ser.baudrate == baud
+                        and data and self._looks_valid(data)):
+                    ser.close()
+
+        report.add(
+            "LOW", "uart", "No responsive baud rate found",
+            f"None of {self.baud_list} produced a coherent response on "
+            f"{self.port}. The console may be disabled, wired "
+            "differently, or using an uncommon baud rate.",
+            "No action needed if this is intentional (console disabled). "
+            "If unexpected, verify wiring (TX/RX/GND) and try additional "
+            "baud rates.",
+            interface=self.port,
+        )
+        return None, None
+
+    @staticmethod
+    def _looks_valid(data):
+        # Mostly-printable bytes, or a recognizable boot/shell pattern,
+        # indicate the baud rate is correct (garbage baud = garbage bytes).
+        printable = sum(1 for b in data if 32 <= b <= 126 or b in (9, 10, 13))
+        if len(data) == 0:
+            return False
+        if printable / len(data) > 0.6:
+            return True
+        return any(p.search(data) for p in SHELL_PROMPT_PATTERNS)
+
+    @staticmethod
+    def _safe_preview(data, limit=200):
+        return data[:limit].decode('utf-8', errors='replace')
+
+    def detect_shell(self, ser, report):
+        """Given an open serial handle at the correct baud, probe for an
+        interactive shell (e.g. hitting Enter during U-Boot autoboot, or a
+        login-less BusyBox console). Logs CRITICAL if shell access is
+        gained, since this typically means full root on the device."""
+        log(f"UART: probing for shell access on {ser.port}", self.quiet)
+        try:
+            ser.reset_input_buffer()
+            ser.write(b'\r\n')
+            time.sleep(0.2)
+            ser.write(b'help\r\n')
+            time.sleep(0.5)
+            resp = ser.read(1024)
+
+            if resp and any(p.search(resp) for p in SHELL_PROMPT_PATTERNS):
+                report.add(
+                    "CRITICAL", "uart", "Interactive shell obtained via UART",
+                    "An interactive command shell (BusyBox/U-Boot/login "
+                    "prompt) was reached over the UART console without "
+                    "any authentication barrier being enforced from this "
+                    "physical interface.",
+                    "Disable the UART console in production firmware, "
+                    "require authentication on serial console, or "
+                    "physically remove/disable the debug header before "
+                    "shipping.",
+                    interface=ser.port,
+                    evidence=self._safe_preview(resp),
+                )
+                return True
+            else:
+                report.add(
+                    "INFO", "uart", "No shell reached via UART",
+                    "UART is responsive but no interactive shell prompt "
+                    "was obtained with a basic probe.",
+                    "None required. Consider deeper interaction (boot "
+                    "interrupt, credential brute force) only with "
+                    "explicit authorization.",
+                    interface=ser.port,
+                )
+                return False
+        except serial.SerialException as e:
+            report.add(
+                "INFO", "uart", "UART disconnected during shell probe",
+                f"Lost connection to {ser.port}: {e}",
+                "Check physical connection and retry.",
+                interface=ser.port,
+            )
+            return False
+
+    def attempt_firmware_dump(self, ser, report, out_path):
+        """Attempt to pull firmware off the device using common shell-level
+        dump primitives. This only works if detect_shell() already
+        confirmed shell access. JTAG/SWD-based extraction is NOT automated
+        here: identifying and using JTAG/SWD pins requires a hardware
+        probe (e.g. J-Link, JTAGulator) and physical pin mapping, which is
+        out of scope for a software-only tool. This function documents
+        that as an INFO finding rather than pretending to do it."""
+        candidate_commands = [
+            b'dump_image\r\n',
+            b'cat /dev/mtd0 > /tmp/mtd0.bin && echo DUMP_OK\r\n',
+            b'cat /proc/mtd\r\n',
+        ]
+        dumped = False
+        collected = b''
+
+        for cmd in candidate_commands:
+            try:
+                ser.reset_input_buffer()
+                ser.write(cmd)
+                time.sleep(1.0)
+                resp = ser.read(4096)
+                collected += resp
+                if b'DUMP_OK' in resp or (b'dump' in cmd and len(resp) > 64):
+                    dumped = True
+            except serial.SerialException as e:
+                report.add(
+                    "INFO", "uart", "Device disconnected during firmware dump",
+                    f"Lost connection while attempting '{cmd.strip()}': {e}",
+                    "Reconnect and retry; consider a slower dump method.",
+                    interface=ser.port,
+                )
+                break
+
+        if dumped:
+            try:
+                with open(out_path, 'wb') as f:
+                    f.write(collected)
+                report.add(
+                    "CRITICAL", "firmware-extraction",
+                    "Firmware extracted via UART shell command",
+                    "Firmware/flash contents were readable via an "
+                    "unauthenticated shell-level command over UART, "
+                    "confirming no protection against physical dumping.",
+                    "Disable UART shell access in production, or enforce "
+                    "authentication before shell commands are accepted.",
+                    interface=ser.port,
+                    evidence=f"saved to {out_path} ({len(collected)} bytes)",
+                )
+            except OSError as e:
+                report.add(
+                    "INFO", "firmware-extraction", "Could not save dump",
+                    f"Dump data was captured but could not be written to "
+                    f"{out_path}: {e}",
+                    "Check output path permissions and disk space.",
+                    interface=ser.port,
+                )
+        else:
+            report.add(
+                "INFO", "firmware-extraction",
+                "Firmware dump via UART not confirmed",
+                "Common dump commands did not return a recognizable "
+                "firmware image over the shell.",
+                "Manual extraction may still be possible via SPI flash "
+                "chip-off or a JTAG/SWD probe (hardware tool required; "
+                "not automatable in software). Inspect the board for "
+                "unpopulated flash/debug headers.",
+                interface=ser.port,
+                evidence=self._safe_preview(collected),
+            )
+
+
+# ----------------------------------------------------------------------------
+# Module 3: Firmware analysis (binwalk + credential/secret string scan)
+# ----------------------------------------------------------------------------
+class FirmwareAnalyzer:
+    def __init__(self, filepath, quiet=False):
+        self.filepath = filepath
+        self.quiet = quiet
+
+    def run_binwalk(self, report):
+        log(f"Firmware: running binwalk on {self.filepath}", self.quiet)
+        try:
+            proc = subprocess.run(
+                ["binwalk", self.filepath],
+                capture_output=True, text=True, timeout=180,
+            )
+        except FileNotFoundError:
+            report.add(
+                "INFO", "firmware-analysis", "binwalk not installed",
+                "binwalk is required for filesystem/signature analysis "
+                "but was not found on PATH.",
+                "Install binwalk (apt install binwalk / pip install "
+                "binwalk) to enable this module.",
+            )
+            return
+        except subprocess.TimeoutExpired:
+            report.add(
+                "INFO", "firmware-analysis", "binwalk timed out",
+                f"binwalk did not complete within the timeout for "
+                f"{self.filepath}.",
+                "Re-run manually on a large image; consider increasing "
+                "the timeout for big firmware files.",
+            )
+            return
+
+        output = proc.stdout.strip()
+        if output:
+            interesting = [
+                line for line in output.splitlines()
+                if re.search(r'(?i)filesystem|squashfs|jffs2|cramfs|'
+                              r'certificate|private key|compressed', line)
+            ]
+            report.add(
+                "INFO", "firmware-analysis", "binwalk signature scan complete",
+                "binwalk identified embedded structures in the firmware "
+                "image (filesystems, compressed regions, and/or "
+                "certificates).",
+                "Extract identified filesystems (`binwalk -e`) for deeper "
+                "manual review of init scripts and configs.",
+                evidence="\n".join(interesting[:25]) or output[:1000],
+            )
+        else:
+            report.add(
+                "LOW", "firmware-analysis", "binwalk found no signatures",
+                "No recognizable file signatures were found in the "
+                "image. It may be encrypted, compressed with a custom "
+                "scheme, or not a firmware image.",
+                "Verify the file is a raw firmware dump; try `binwalk -E` "
+                "for entropy analysis to check for encryption.",
+            )
+
+    @staticmethod
+    def _extract_ascii_strings(data, min_len=4):
+        """Pure-Python fallback equivalent to the `strings` utility, used
+        if the `strings` binary isn't available on the host."""
+        pattern = re.compile(b'[\x20-\x7e]{%d,}' % min_len)
+        return pattern.findall(data)
+
+    def extract_strings_and_scan(self, report):
+        log(f"Firmware: extracting strings from {self.filepath}", self.quiet)
+        try:
+            with open(self.filepath, 'rb') as f:
+                data = f.read()
+        except OSError as e:
+            report.add(
+                "INFO", "firmware-analysis", "Could not read firmware file",
+                f"Failed to open {self.filepath}: {e}",
+                "Verify the path and file permissions.",
+            )
+            return
+
+        # Prefer the real `strings` binary if present (faster on huge
+        # images); otherwise use the pure-Python fallback above.
+        lines = None
+        try:
+            proc = subprocess.run(
+                ["strings", "-n", "4", self.filepath],
+                capture_output=True, text=True, timeout=120,
+            )
+            lines = [l.encode() for l in proc.stdout.splitlines()]
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            lines = self._extract_ascii_strings(data)
+
+        found_any = False
+        for pattern, label, severity in CRED_PATTERNS:
+            matches = set()
+            for line in lines:
+                m = pattern.search(line)
+                if m:
+                    matches.add(line[:120].decode('utf-8', errors='replace'))
+                if len(matches) >= 5:
+                    break
+            if matches:
+                found_any = True
+                report.add(
+                    severity, "firmware-analysis", label,
+                    f"Firmware string analysis matched a pattern "
+                    f"consistent with: {label.lower()}.",
+                    "Remove hardcoded secrets from firmware; use "
+                    "per-device provisioning, secure elements, or "
+                    "runtime-injected credentials instead.",
+                    evidence="; ".join(list(matches)[:5]),
+                )
+
+        if not found_any:
+            report.add(
+                "INFO", "firmware-analysis", "No obvious hardcoded secrets found",
+                "String-pattern scan did not match common credential, "
+                "key, or endpoint patterns. This does not rule out "
+                "obfuscated or encrypted secrets.",
+                "Consider entropy analysis and manual review for "
+                "obfuscated credential storage.",
+            )
+
+
+# ----------------------------------------------------------------------------
+# Module 4: Network discovery
+# ----------------------------------------------------------------------------
+class NetworkScanner:
+    def __init__(self, ip, ports=None, timeout=1.5, quiet=False):
+        self.ip = ip
+        self.ports = ports or COMMON_PORTS
+        self.timeout = timeout
+        self.quiet = quiet
+
+    def scan(self, report):
+        log(f"Network: scanning {len(self.ports)} common ports on {self.ip}", self.quiet)
+        open_ports = []
+
+        for port, (name, category) in self.ports.items():
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                    s.settimeout(self.timeout)
+                    result = s.connect_ex((self.ip, port))
+                    if result == 0:
+                        open_ports.append((port, name, category))
+                        log(f"Network: {self.ip}:{port} ({name}) OPEN", self.quiet)
+            except socket.gaierror as e:
+                report.add(
+                    "INFO", "network", "DNS/address resolution failed",
+                    f"Could not resolve or reach {self.ip}: {e}",
+                    "Verify the IP/hostname is correct and reachable.",
+                )
+                return
+            except OSError as e:
+                log(f"Network: error probing {self.ip}:{port}: {e}", self.quiet)
+                continue
+
+        if not open_ports:
+            report.add(
+                "INFO", "network", "No common ports open",
+                f"None of the {len(self.ports)} commonly-checked IoT/"
+                f"camera/drone ports responded on {self.ip}.",
+                "None required, or expand the port list if the device "
+                "is known to use nonstandard ports.",
+                device_type="network", interface=self.ip,
+            )
+            return
+
+        for port, name, category in open_ports:
+            severity, remediation = self._triage(name, category)
+            report.add(
+                severity, "network", f"Open port: {port}/{name}",
+                f"{name} is reachable on {self.ip}:{port}.",
+                remediation,
+                interface=f"{self.ip}:{port}",
+            )
+
+    @staticmethod
+    def _triage(name, category):
+        if category == "cleartext-remote-shell":
+            return "HIGH", ("Disable Telnet; use SSH with key-based auth "
+                             "and disable password login.")
+        if category == "cleartext-file-transfer":
+            return "MEDIUM", "Disable FTP; use SFTP/SCP instead."
+        if category == "video-stream":
+            return "HIGH", ("Require authentication on the RTSP stream; "
+                             "verify it is not accessible without "
+                             "credentials.")
+        if category == "cleartext-iot-messaging":
+            return "MEDIUM", "Require TLS + auth on the MQTT broker."
+        if category == "mavlink":
+            return "MEDIUM", ("Restrict MAVLink port exposure to trusted "
+                               "networks/links; enable MAVLink2 message "
+                               "signing.")
+        if category == "remote-shell":
+            return "LOW", "Ensure SSH uses key-based auth and is patched."
+        if category == "debug":
+            return "MEDIUM", "Disable debug services before shipping."
+        return "INFO", "Confirm this service requires authentication."
+
+
+# ----------------------------------------------------------------------------
+# Module 5: MAVLink drone assessment
+# ----------------------------------------------------------------------------
+class MAVLinkScanner:
+    def __init__(self, connection_string, timeout=10, quiet=False):
+        self.connection_string = connection_string
+        self.timeout = timeout
+        self.quiet = quiet
+        self.master = None
+
+    def connect(self, report):
+        if mavutil is None:
+            report.add(
+                "INFO", "dependency", "pymavlink not installed",
+                "pymavlink is required for MAVLink assessment but is not "
+                "installed.",
+                "pip install pymavlink",
+            )
+            return False
+        log(f"MAVLink: connecting to {self.connection_string}", self.quiet)
+        try:
+            self.master = mavutil.mavlink_connection(self.connection_string)
+        except Exception as e:  # pymavlink raises various connection errors
+            report.add(
+                "INFO", "mavlink", "MAVLink connection failed",
+                f"Could not open MAVLink connection "
+                f"'{self.connection_string}': {e}",
+                "Verify the connection string (udp:HOST:PORT, "
+                "tcp:HOST:PORT, or a serial device) and that the link is "
+                "active.",
+            )
+            return False
+        return True
+
+    def listen_heartbeat(self, report):
+        log("MAVLink: waiting for HEARTBEAT", self.quiet)
+        try:
+            hb = self.master.wait_heartbeat(timeout=self.timeout)
+        except Exception as e:
+            report.add(
+                "INFO", "mavlink", "Error waiting for heartbeat", str(e),
+                "Verify link connectivity and MAVLink protocol version.",
+            )
+            return None
+        if hb is None:
+            report.add(
+                "INFO", "mavlink", "No HEARTBEAT received",
+                f"No MAVLink HEARTBEAT was received within "
+                f"{self.timeout}s on {self.connection_string}.",
+                "Confirm the drone/GCS link is powered on and the "
+                "connection string targets the right endpoint.",
+            )
+            return None
+
+        report.add(
+            "INFO", "mavlink", "MAVLink HEARTBEAT received",
+            f"Device identified as a MAVLink-compatible system "
+            f"(sysid={self.master.target_system}, "
+            f"compid={self.master.target_component}) on "
+            f"{self.connection_string}.",
+            "None required; informational device identification.",
+            device_type="drone/UAV", interface=self.connection_string,
+        )
+        return hb
+
+    def check_signing(self, report):
+        """MAVLink2 supports optional per-message signing (HMAC-SHA256).
+        If signing is not enabled, any device on the link/network can
+        inject or spoof telemetry and commands. We inspect the raw
+        incompatibility flag on received messages rather than trusting
+        connection metadata."""
+        signed_seen = False
+        unsigned_seen = False
+        try:
+            for _ in range(20):
+                msg = self.master.recv_match(blocking=True, timeout=1)
+                if msg is None:
+                    continue
+                raw = msg.get_msgbuf()
+                # MAVLink2 magic byte is 0xFD; incompat flags is byte 2.
+                if len(raw) > 2 and raw[0] == 0xFD:
+                    incompat_flags = raw[2]
+                    if incompat_flags & 0x01:  # MAVLINK_IFLAG_SIGNED
+                        signed_seen = True
+                    else:
+                        unsigned_seen = True
+                else:
+                    unsigned_seen = True  # MAVLink1 has no signing at all
+        except Exception as e:
+            log(f"MAVLink: signing check error: {e}", self.quiet)
+
+        if unsigned_seen and not signed_seen:
+            report.add(
+                "HIGH", "mavlink", "MAVLink traffic is unsigned",
+                "Observed MAVLink messages do not use MAVLink2 message "
+                "signing. Telemetry and commands on this link can be "
+                "spoofed or injected by anyone with link/network access.",
+                "Enable MAVLink2 signing with a shared secret key on "
+                "both the autopilot and ground control station.",
+                device_type="drone/UAV", interface=self.connection_string,
+            )
+        elif signed_seen:
+            report.add(
+                "INFO", "mavlink", "MAVLink signing observed",
+                "At least some observed MAVLink traffic carries the "
+                "MAVLink2 signing flag.",
+                "Confirm signing is enforced (not just available) on "
+                "all critical command messages.",
+                device_type="drone/UAV", interface=self.connection_string,
+            )
+
+    def check_plaintext_telemetry(self, report):
+        log("MAVLink: sampling telemetry for GPS/battery data", self.quiet)
+        gps_seen = False
+        battery_seen = False
+        evidence = []
+        try:
+            for _ in range(40):
+                msg = self.master.recv_match(
+                    type=['GPS_RAW_INT', 'GLOBAL_POSITION_INT',
+                          'BATTERY_STATUS', 'SYS_STATUS'],
+                    blocking=True, timeout=1,
+                )
+                if msg is None:
+                    continue
+                mtype = msg.get_type()
+                if mtype in ('GPS_RAW_INT', 'GLOBAL_POSITION_INT'):
+                    gps_seen = True
+                    evidence.append(mtype)
+                elif mtype in ('BATTERY_STATUS', 'SYS_STATUS'):
+                    battery_seen = True
+                    evidence.append(mtype)
+                if gps_seen and battery_seen:
+                    break
+        except Exception as e:
+            log(f"MAVLink: telemetry sampling error: {e}", self.quiet)
+
+        if gps_seen or battery_seen:
+            report.add(
+                "MEDIUM", "mavlink", "Plaintext flight telemetry observed",
+                "GPS position and/or battery/system status telemetry "
+                "was readable in plaintext on this MAVLink link "
+                "(" + ", ".join(sorted(set(evidence))) + "). Anyone "
+                "with access to the link/network can passively track "
+                "the aircraft.",
+                "Encrypt the transport (VPN/DTLS tunnel for UDP links) "
+                "in addition to enabling MAVLink2 signing, since signing "
+                "authenticates but does not encrypt.",
+                device_type="drone/UAV", interface=self.connection_string,
+            )
+
+    def test_command_acceptance(self, report, confirmed=False):
+        """Sends a deliberately benign, non-actuating command
+        (MAV_CMD_REQUEST_MESSAGE) from this unauthenticated connection and
+        checks whether the flight controller acknowledges/accepts it. This
+        demonstrates the command-injection vulnerability class (an
+        unauthenticated party can issue accepted commands) WITHOUT sending
+        anything that moves control surfaces, arms motors, or changes
+        flight mode. Requires an explicit --confirm-injection-test flag
+        because it actively transmits to a real flight controller."""
+        if not confirmed:
+            report.add(
+                "INFO", "mavlink", "Command injection test skipped",
+                "Active command-acceptance testing was not run because "
+                "--confirm-injection-test was not supplied.",
+                "Re-run with --confirm-injection-test in a controlled "
+                "test environment to actively verify this class of "
+                "vulnerability.",
+                device_type="drone/UAV", interface=self.connection_string,
+            )
+            return
+        try:
+            # MAV_CMD_REQUEST_MESSAGE = 512, param1 = HEARTBEAT (id 0).
+            # This only asks the FC to (re)send a message; it cannot
+            # actuate anything.
+            self.master.mav.command_long_send(
+                self.master.target_system,
+                self.master.target_component,
+                512, 0,  # command, confirmation
+                0, 0, 0, 0, 0, 0, 0,
+            )
+            ack = self.master.recv_match(
+                type='COMMAND_ACK', blocking=True, timeout=self.timeout,
+            )
+        except Exception as e:
+            report.add(
+                "INFO", "mavlink", "Command acceptance test error",
+                f"Error sending/receiving during injection test: {e}",
+                "Retry with a stable link.",
+                device_type="drone/UAV", interface=self.connection_string,
+            )
+            return
+
+        if ack is not None and ack.result == 0:  # MAV_RESULT_ACCEPTED
+            report.add(
+                "CRITICAL", "mavlink",
+                "Unauthenticated command accepted by flight controller",
+                "A benign command sent from this tool, with no prior "
+                "authentication or pairing, was ACCEPTED by the flight "
+                "controller. This confirms the link accepts commands "
+                "from unauthenticated senders; a malicious actor could "
+                "send actuating commands (mode change, arm/disarm, "
+                "RTL override, etc.) the same way.",
+                "Enable MAVLink2 signing, restrict the command link to "
+                "authenticated/trusted endpoints, and consider "
+                "network-level isolation (no open UDP telemetry port on "
+                "public networks).",
+                device_type="drone/UAV", interface=self.connection_string,
+            )
+        else:
+            report.add(
+                "LOW", "mavlink", "Benign command not accepted",
+                "The test command was not accepted (or no ACK was "
+                "received). This does not prove the link is protected — "
+                "only that this specific probe wasn't acknowledged.",
+                "No action required from this result alone; combine with "
+                "the signing check above for a full picture.",
+                device_type="drone/UAV", interface=self.connection_string,
+            )
+
+
+# ----------------------------------------------------------------------------
+# Module 6: BLE sniffing (discovery + GATT enumeration)
+# ----------------------------------------------------------------------------
+class BLEScanner:
+    def __init__(self, quiet=False):
+        self.quiet = quiet
+
+    async def discover(self, report, scan_time=10.0):
+        if BleakScanner is None:
+            report.add(
+                "INFO", "dependency", "bleak not installed",
+                "bleak is required for BLE scanning but is not installed.",
+                "pip install bleak",
+            )
+            return []
+
+        log(f"BLE: scanning for {scan_time}s", self.quiet)
+        try:
+            devices = await BleakScanner.discover(timeout=scan_time)
+        except Exception as e:
+            report.add(
+                "INFO", "ble", "BLE discovery failed",
+                f"Could not complete BLE scan: {e}",
+                "Confirm a Bluetooth adapter is present and powered on. "
+                "On Linux, confirm BlueZ is running (`sudo systemctl "
+                "start bluetooth`); some backends need cap_net_raw or "
+                "root to scan.",
+            )
+            return []
+
+        if not devices:
+            report.add(
+                "INFO", "ble", "No BLE devices discovered",
+                f"No advertising BLE devices were seen in {scan_time}s.",
+                "Move closer to the target, increase --ble-scan-time, or "
+                "confirm the device is advertising (some devices only "
+                "advertise briefly on power-on or button press).",
+            )
+            return []
+
+        summary = [f"{d.address} ({d.name or 'unnamed'}, RSSI {d.rssi})"
+                   for d in devices]
+        report.add(
+            "INFO", "ble", "BLE devices discovered",
+            f"{len(devices)} BLE-advertising device(s) found nearby.",
+            "Identify the target device by name/address, then run "
+            "--ble-enum against it.",
+            evidence="; ".join(summary[:15]),
+        )
+        return devices
+
+    async def enumerate_gatt(self, address, report):
+        if BleakClient is None:
+            report.add(
+                "INFO", "dependency", "bleak not installed",
+                "bleak is required for GATT enumeration but is not "
+                "installed.",
+                "pip install bleak",
+            )
+            return
+
+        log(f"BLE: connecting to {address}", self.quiet)
+        try:
+            async with BleakClient(address) as client:
+                if not client.is_connected:
+                    report.add(
+                        "INFO", "ble", "BLE connection failed",
+                        f"Could not establish a GATT connection to "
+                        f"{address}.",
+                        "Confirm the address is correct and the device is "
+                        "in range and advertising connectable mode.",
+                        interface=address,
+                    )
+                    return
+
+                report.add(
+                    "INFO", "ble", "No pairing required for GATT connection",
+                    f"A GATT connection to {address} was established "
+                    "without any pairing/bonding prompt.",
+                    "If this device carries sensitive data or control "
+                    "characteristics, require BLE bonding and encryption "
+                    "(Security Mode 1, Level 3 or 4) instead of allowing "
+                    "open connections.",
+                    interface=address,
+                )
+
+                char_count = 0
+                vendor_readable = []
+                cred_hits = 0
+
+                for service in client.services:
+                    for char in service.characteristics:
+                        char_count += 1
+                        if 'read' not in char.properties:
+                            continue
+                        try:
+                            value = await client.read_gatt_char(char.uuid)
+                        except Exception:
+                            # Requires auth/encryption we don't have, or
+                            # the read otherwise isn't actually permitted.
+                            continue
+                        if not value:
+                            continue
+
+                        # Reuse the same credential/secret patterns applied
+                        # to firmware strings -- a hit here means a BLE
+                        # characteristic is handing out the same class of
+                        # sensitive data, readable with no pairing at all.
+                        matched = False
+                        for pattern, label, severity in CRED_PATTERNS:
+                            if pattern.search(bytes(value)):
+                                cred_hits += 1
+                                matched = True
+                                report.add(
+                                    severity, "ble",
+                                    f"BLE characteristic exposes: {label}",
+                                    f"Characteristic {char.uuid} on service "
+                                    f"{service.uuid} returned data matching "
+                                    f"a {label.lower()} pattern, readable "
+                                    "without pairing.",
+                                    "Never transmit credentials/secrets "
+                                    "over unauthenticated BLE "
+                                    "characteristics. Require bonding and "
+                                    "encrypt the characteristic, or move "
+                                    "provisioning to an out-of-band flow.",
+                                    interface=address,
+                                    evidence=bytes(value)[:80].decode(
+                                        'utf-8', errors='replace'),
+                                )
+                                break
+
+                        if not matched and not is_standard_ble_uuid(str(char.uuid)):
+                            vendor_readable.append(str(char.uuid))
+
+                if vendor_readable:
+                    report.add(
+                        "LOW", "ble",
+                        "Custom BLE characteristics readable without pairing",
+                        f"{len(vendor_readable)} vendor-specific (non-SIG-"
+                        "standard) characteristic(s) were readable without "
+                        "any pairing step. No credential pattern matched "
+                        "their contents, but they're not standard, "
+                        "publicly-documented GATT services and warrant "
+                        "manual review.",
+                        "Review what data these characteristics expose; "
+                        "restrict read access with encryption/bonding if "
+                        "the data is sensitive.",
+                        interface=address,
+                        evidence="; ".join(vendor_readable[:15]),
+                    )
+
+                report.add(
+                    "INFO", "ble", "GATT enumeration complete",
+                    f"Enumerated {len(list(client.services))} service(s), "
+                    f"{char_count} characteristic(s) total on {address}.",
+                    "None required; informational summary.",
+                    interface=address,
+                )
+        except Exception as e:
+            report.add(
+                "INFO", "ble", "BLE GATT enumeration error",
+                f"Error during GATT enumeration on {address}: {e}",
+                "Retry; some devices disconnect idle connections quickly "
+                "or require pairing before allowing full enumeration.",
+                interface=address,
+            )
+
+
+async def run_ble_module(report, do_scan, do_enum, address, scan_time, quiet):
+    """Single asyncio entry point for the BLE module, so main() (which is
+    otherwise synchronous) can invoke it with one asyncio.run() call."""
+    ble = BLEScanner(quiet=quiet)
+    if do_scan:
+        await ble.discover(report, scan_time=scan_time)
+    if do_enum and address:
+        await ble.enumerate_gatt(address, report)
+
+
+# ----------------------------------------------------------------------------
+# CLI / orchestration
+# ----------------------------------------------------------------------------
+def build_arg_parser():
+    p = argparse.ArgumentParser(
+        prog="iot_scanner.py",
+        description=(
+            "IoT camera / drone security assessment tool. " + SAFETY_BANNER
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  python iot_scanner.py --uart /dev/ttyUSB0 --baud-scan\n"
+            "  python iot_scanner.py --firmware firmware.bin --analyze\n"
+            "  python iot_scanner.py --ip 192.168.1.100 --scan\n"
+            "  python iot_scanner.py --mavlink-connection udp:0.0.0.0:14550 --mavlink\n"
+            "  python iot_scanner.py --ble-scan\n"
+            "  python iot_scanner.py --ble-address AA:BB:CC:DD:EE:FF --ble-enum\n"
+            "  python iot_scanner.py --all --output results.json\n"
+        ),
+    )
+    p.add_argument("--uart", metavar="PORT", help="Serial device path, e.g. /dev/ttyUSB0")
+    p.add_argument("--baud-scan", action="store_true", help="Auto-detect UART baud rate and probe for shell access")
+    p.add_argument("--baud", type=int, help="Skip baud scan and use this rate directly")
+    p.add_argument("--dump-firmware", metavar="OUT_FILE", help="Attempt firmware dump over UART shell, save to OUT_FILE")
+
+    p.add_argument("--firmware", metavar="FILE", help="Path to a firmware binary")
+    p.add_argument("--analyze", action="store_true", help="Run binwalk + credential string scan on --firmware")
+
+    p.add_argument("--ip", metavar="IP", help="Target device IP address")
+    p.add_argument("--scan", action="store_true", help="Run network port discovery against --ip")
+
+    p.add_argument("--mavlink", action="store_true", help="Run MAVLink drone assessment")
+    p.add_argument("--mavlink-connection", metavar="CONN",
+                    help="MAVLink connection string, e.g. udp:0.0.0.0:14550, "
+                         "tcp:192.168.1.1:5760, or /dev/ttyACM0")
+    p.add_argument("--confirm-injection-test", action="store_true",
+                    help="Actively send a benign MAVLink command to test "
+                         "unauthenticated command acceptance (requires a "
+                         "controlled test environment)")
+
+    p.add_argument("--ble-scan", action="store_true", help="Discover nearby BLE-advertising devices")
+    p.add_argument("--ble-scan-time", type=float, default=10.0, help="BLE discovery duration in seconds (default 10)")
+    p.add_argument("--ble-address", metavar="ADDR",
+                    help="Target BLE device address (MAC on Linux/Windows, UUID on macOS) for GATT enumeration")
+    p.add_argument("--ble-enum", action="store_true",
+                    help="Connect to --ble-address and enumerate GATT services/characteristics, "
+                         "scanning readable ones for exposed credentials")
+
+    p.add_argument("--all", action="store_true",
+                    help="Run every module applicable to the target(s) supplied")
+
+    p.add_argument("--output", metavar="FILE", help="Write JSON report to FILE (always also usable via stdout)")
+    p.add_argument("--quiet", action="store_true", help="Suppress progress output; print only JSON")
+    p.add_argument("--verbose", action="store_true", help="Print progress output (default unless --quiet)")
+
+    return p
+
+
+def main():
+    parser = build_arg_parser()
+    args = parser.parse_args()
+    quiet = args.quiet and not args.verbose
+
+    if not quiet:
+        print(f"[!] {SAFETY_BANNER}", file=sys.stderr)
+
+    targets = {
+        "uart": args.uart, "firmware": args.firmware,
+        "ip": args.ip, "mavlink_connection": args.mavlink_connection,
+        "ble_address": args.ble_address,
+    }
+    report = Report(targets)
+
+    ran_any = False
+
+    # --- UART / firmware dump -------------------------------------------
+    if args.uart and (args.baud_scan or args.baud or args.dump_firmware or args.all):
+        ran_any = True
+        if serial is None:
+            report.add(
+                "INFO", "dependency", "pyserial not installed",
+                "UART modules require pyserial.",
+                "pip install pyserial",
+            )
+        else:
+            uart = UARTScanner(args.uart, quiet=quiet)
+            ser, baud = (None, None)
+            if args.baud:
+                try:
+                    ser = uart._open(args.baud)
+                    baud = args.baud
+                except (serial.SerialException, OSError) as e:
+                    report.add(
+                        "INFO", "uart", "Unable to open serial port",
+                        f"Could not open {args.uart} @ {args.baud}: {e}",
+                        "Check device path and permissions.",
+                        interface=args.uart,
+                    )
+            else:
+                ser, baud = uart.scan_baud_rates(report)
+
+            if ser:
+                try:
+                    has_shell = uart.detect_shell(ser, report)
+                    if has_shell and (args.dump_firmware or args.all):
+                        out_path = args.dump_firmware or "firmware_dump.bin"
+                        uart.attempt_firmware_dump(ser, report, out_path)
+                finally:
+                    ser.close()
+
+    # --- Firmware analysis ------------------------------------------------
+    if args.firmware and (args.analyze or args.all):
+        ran_any = True
+        if not os.path.isfile(args.firmware):
+            report.add(
+                "INFO", "firmware-analysis", "Firmware file not found",
+                f"{args.firmware} does not exist or is not readable.",
+                "Verify the path.",
+            )
+        else:
+            fa = FirmwareAnalyzer(args.firmware, quiet=quiet)
+            fa.run_binwalk(report)
+            fa.extract_strings_and_scan(report)
+
+    # --- Network discovery --------------------------------------------
+    if args.ip and (args.scan or args.all):
+        ran_any = True
+        ns = NetworkScanner(args.ip, quiet=quiet)
+        ns.scan(report)
+
+    # --- MAVLink ------------------------------------------------------
+    mavlink_target = args.mavlink_connection or (
+        f"udp:{args.ip}:14550" if args.ip and args.all else None
+    )
+    if mavlink_target and (args.mavlink or args.all):
+        ran_any = True
+        ms = MAVLinkScanner(mavlink_target, quiet=quiet)
+        if ms.connect(report):
+            hb = ms.listen_heartbeat(report)
+            if hb is not None:
+                ms.check_signing(report)
+                ms.check_plaintext_telemetry(report)
+                ms.test_command_acceptance(
+                    report, confirmed=args.confirm_injection_test,
+                )
+
+    # --- BLE ------------------------------------------------------------
+    do_ble_scan = args.ble_scan or args.all
+    do_ble_enum = (args.ble_enum or args.all) and bool(args.ble_address)
+    if do_ble_scan or do_ble_enum:
+        ran_any = True
+        try:
+            asyncio.run(run_ble_module(
+                report, do_ble_scan, do_ble_enum, args.ble_address,
+                args.ble_scan_time, quiet,
+            ))
+        except Exception as e:
+            report.add(
+                "INFO", "ble", "BLE module error",
+                f"Unexpected error running BLE module: {e}",
+                "Retry; confirm a Bluetooth adapter is present and "
+                "enabled.",
+            )
+
+    if not ran_any:
+        parser.print_help(sys.stderr)
+        print(
+            "\n[!] No target/module combination was runnable. Provide a "
+            "target (--uart/--firmware/--ip/--mavlink-connection) along "
+            "with its module flag, or use --all.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    result = report.to_dict()
+    output_json = json.dumps(result, indent=2)
+
+    if args.output:
+        try:
+            with open(args.output, 'w') as f:
+                f.write(output_json)
+            log(f"Report written to {args.output}", quiet)
+        except OSError as e:
+            print(f"[!] Failed to write output file: {e}", file=sys.stderr)
+
+    print(output_json)
+
+
+if __name__ == "__main__":
+    main()
